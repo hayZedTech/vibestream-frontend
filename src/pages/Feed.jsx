@@ -33,6 +33,9 @@ export default function Feed({ isProfile = false }) {
   // NEW: lift notifications open state so we can coordinate with inbox
   const [showNotifications, setShowNotifications] = useState(false);
 
+  // NEW: manage chats panel visibility
+  const [showManageChats, setShowManageChats] = useState(false);
+
   const MAX_IMAGE_SIZE_MB = 3;
   const LIMIT = 5;
   const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
@@ -45,6 +48,37 @@ export default function Feed({ isProfile = false }) {
   const chatInputRef = useRef(null);
   const chatListRef = useRef(null);
   const quickNameRef = useRef(null);
+
+  // ---------------------- message normalization helper ----------------------
+  const normalizeMsg = (m) => {
+    if (!m || typeof m !== "object") return {
+      fromUsername: "", toUsername: "", text: String(m || ""), createdAt: new Date().toISOString(), _id: `msg-${Date.now()}`
+    };
+
+    const from =
+      m.fromUsername ||
+      m.from ||
+      (m.fromUser && (m.fromUser.username || m.fromUser.name)) ||
+      (m.from_user && (m.from_user.username || m.from_user.name)) ||
+      "";
+    const to =
+      m.toUsername ||
+      m.to ||
+      (m.toUser && (m.toUser.username || m.toUser.name)) ||
+      (m.to_user && (m.to_user.username || m.to_user.name)) ||
+      "";
+    const text = m.text || m.message || m.body || m.msg || "";
+    const createdAt = m.createdAt || m.created_at || m.created || m.timestamp || m.time || new Date().toISOString();
+    const id = m._id || m.id || m.msgId || m.messageId || `${from}-${to}-${createdAt}-${Math.random().toString(36).slice(2,8)}`;
+    return {
+      ...m,
+      fromUsername: String(from || "").trim(),
+      toUsername: String(to || "").trim(),
+      text: String(text || ""),
+      createdAt,
+      _id: id,
+    };
+  };
 
   // ---------------------- utility: try multiple auth/me endpoints ----------------------
   const tryLoadCurrentUser = async () => {
@@ -88,11 +122,13 @@ export default function Feed({ isProfile = false }) {
     try {
       try {
         const res = await API.get(`/messages/recent?user=${encodeURIComponent(username)}`);
-        setRecentMessages(res.data || []);
+        const arr = Array.isArray(res.data) ? res.data.map(normalizeMsg) : [];
+        setRecentMessages(arr);
         return;
       } catch (innerErr) {
         const res2 = await API.get(`/messages?user=${encodeURIComponent(username)}`);
-        setRecentMessages(res2.data || []);
+        const arr2 = Array.isArray(res2.data) ? res2.data.map(normalizeMsg) : [];
+        setRecentMessages(arr2);
         return;
       }
     } catch (e) {
@@ -166,7 +202,9 @@ export default function Feed({ isProfile = false }) {
       Swal.fire({ toast: true, position: "top-end", icon: "info", title: `${notif.type} from ${notif.fromUsername || "Someone"}`, showConfirmButton: false, timer: 2500 });
     });
 
-    socket.on("chatMessage", (msg) => {
+    socket.on("chatMessage", (rawMsg) => {
+      const msg = normalizeMsg(rawMsg);
+
       setRecentMessages((prev) => {
         const arr = Array.isArray(prev) ? [...prev] : [];
         const idx = arr.findIndex((m) => (m._id && msg._id && m._id === msg._id) || (m.createdAt === msg.createdAt && m.fromUsername === msg.fromUsername && m.toUsername === msg.toUsername && m.text === msg.text));
@@ -256,7 +294,7 @@ export default function Feed({ isProfile = false }) {
   const handleLike = async (postId) => {
     try {
       const res = await API.put(`/posts/${postId}/like`);
-      setPosts((prev) => prev.map((p) => (p._id === postId ? res.data : p)));
+      setPosts((prev) => prev.map((p) => (p._1d === postId ? res.data : p)));
       socket.emit("newLike", { postId, fromUserId: loggedInUsername, postOwnerId: res.data.user.username });
     } catch (err) {
       console.warn("like error", err);
@@ -289,7 +327,8 @@ export default function Feed({ isProfile = false }) {
     if (!userA || !userB) return;
     try {
       const res = await API.get(`/messages/conversation?userA=${encodeURIComponent(userA)}&userB=${encodeURIComponent(userB)}`);
-      setChatMessages(res.data || []);
+      const arr = Array.isArray(res.data) ? res.data.map(normalizeMsg) : [];
+      setChatMessages(arr);
       try {
         await API.put('/messages/conversation/mark-read', { username: loggedInUsername, peer: userB });
         setRecentMessages((prev) => prev.map(m => (m.fromUsername === userB && m.toUsername === loggedInUsername ? { ...m, read: true } : m)));
@@ -317,7 +356,7 @@ export default function Feed({ isProfile = false }) {
     const text = chatInputRef.current.value.trim();
     const payload = { fromUsername: loggedInUsername, toUsername: chatTo.trim(), text };
 
-    const tempMsg = { ...payload, createdAt: new Date().toISOString(), _id: `temp-${Date.now()}`, read: false };
+    const tempMsg = normalizeMsg({ ...payload, _id: `temp-${Date.now()}`, createdAt: new Date().toISOString() });
     setChatMessages((prev) => [...prev, tempMsg]);
     setRecentMessages((prev) => [tempMsg, ...prev.filter(m => m._id !== tempMsg._id)]);
     chatInputRef.current.value = "";
@@ -325,7 +364,7 @@ export default function Feed({ isProfile = false }) {
 
     try {
       const res = await API.post('/messages', payload);
-      const saved = res.data;
+      const saved = normalizeMsg(res.data);
       setChatMessages((prev) => {
         const withoutTemp = prev.filter(m => m._id !== tempMsg._id);
         return [...withoutTemp, saved];
@@ -353,7 +392,78 @@ export default function Feed({ isProfile = false }) {
     }
     setChatTo(username);
     setChatVisible(true);
-    fetchConversation(loggedInUsername, username);
+    // ensure username loaded before fetch
+    if (!loggedInUsername) {
+      tryLoadCurrentUser().then((u) => {
+        if (u && u.username) fetchConversation(u.username, username);
+      });
+    } else {
+      fetchConversation(loggedInUsername, username);
+    }
+  };
+
+  // ---------------------- delete conversation ----------------------
+  const deleteConversation = async (peer) => {
+    if (!peer || !loggedInUsername) return;
+    const ok = await Swal.fire({
+      title: `Delete conversation with ${peer}?`,
+      text: "This will remove the conversation for you. This cannot be undone.",
+      icon: "warning",
+      showCancelButton: true,
+      confirmButtonText: "Delete",
+      cancelButtonText: "Cancel"
+    });
+    if (!ok.isConfirmed) return;
+
+    // Try several server endpoints (DELETE with query, DELETE with body, POST fallback)
+    const attempts = [
+      async () => API.delete(`/messages/conversation?userA=${encodeURIComponent(loggedInUsername)}&userB=${encodeURIComponent(peer)}`),
+      async () => API.delete(`/messages/conversation`, { data: { userA: loggedInUsername, userB: peer } }),
+      async () => API.post(`/messages/conversation/delete`, { userA: loggedInUsername, userB: peer }),
+    ];
+
+    let succeeded = false;
+    for (const attempt of attempts) {
+      try {
+        await attempt();
+        succeeded = true;
+        break;
+      } catch (err) {
+        console.warn("delete conversation attempt failed:", err);
+        if (err?.response?.status === 401 || err?.response?.status === 403) {
+          Swal.fire("Permission denied", "You are not authorized to delete this conversation.", "error");
+          return;
+        }
+        // otherwise continue to next attempt
+      }
+    }
+
+    if (!succeeded) {
+      Swal.fire("Error", "Failed to delete conversation on server. Removed locally.", "warning");
+      // fallback: remove locally anyway
+      setRecentMessages((prev) => (Array.isArray(prev) ? prev.filter(m => {
+        const peerName = m.fromUsername === loggedInUsername ? m.toUsername : m.fromUsername;
+        return peerName !== peer;
+      }) : []));
+      if (chatTo === peer) {
+        setChatTo(null);
+        setChatMessages([]);
+        setChatVisible(false);
+      }
+      return;
+    }
+
+    // If succeeded on the server, update UI
+    setRecentMessages((prev) => (Array.isArray(prev) ? prev.filter(m => {
+      const peerName = m.fromUsername === loggedInUsername ? m.toUsername : m.fromUsername;
+      return peerName !== peer;
+    }) : []));
+    if (chatTo === peer) {
+      setChatTo(null);
+      setChatMessages([]);
+      setChatVisible(false);
+    }
+    Swal.fire({ icon: "success", title: "Deleted", text: `Conversation with ${peer} removed.`, timer: 1400, showConfirmButton: false });
   };
 
   const unreadCount = recentMessages.filter((m) => m.toUsername === loggedInUsername && !m.read).length;
@@ -395,10 +505,52 @@ export default function Feed({ isProfile = false }) {
     }
   };
 
+  // derive a unique list of chat peers (for Manage Chats view)
+  const getUniquePeers = () => {
+    if (!Array.isArray(recentMessages)) return [];
+    const map = new Map();
+    for (const m of recentMessages) {
+      const peer = m.fromUsername === loggedInUsername ? m.toUsername : m.fromUsername;
+      if (!peer) continue;
+      // keep the most recent message per peer
+      if (!map.has(peer) || new Date(m.createdAt) > new Date(map.get(peer).createdAt)) {
+        map.set(peer, m);
+      }
+    }
+    // return array sorted by latest message
+    return Array.from(map.entries()).sort((a, b) => new Date(b[1].createdAt) - new Date(a[1].createdAt)).map(([peer, msg]) => ({ peer, lastMessage: msg }));
+  };
+
   // ---------------------- render ----------------------
   return (
     
     <div className="container mt-4" style={{ maxWidth: 800}}>
+      {/* Full-page loading overlay when fetching the posts (initial load) */}
+      {fetching && page === 1 && (
+        <div
+          aria-hidden={!fetching}
+          style={{
+            position: "fixed",
+            left: 0,
+            top: 0,
+            width: "100vw",
+            height: "100vh",
+            background: "rgba(255,255,255,0.8)",
+            zIndex: 3000,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center"
+          }}
+        >
+          <div className="text-center" role="status" aria-live="polite" style={{ transform: "translateY(-10px)" }}>
+            <div className="spinner-border" role="status" style={{ width: "4rem", height: "4rem" }}>
+              <span className="visually-hidden">Loading...</span>
+            </div>
+            <div className="mt-3 fw-semibold">Loading posts…</div>
+          </div>
+        </div>
+      )}
+
       <div className="d-flex align-items-center justify-content-between mb-3">
         <h2 className="mb-0 fw-bold">{isProfile ? "👤 My Posts" : "📢 Social Feed"}</h2>
 
@@ -425,25 +577,59 @@ export default function Feed({ isProfile = false }) {
             {unreadCount > 0 && (<span style={{ position: "absolute", top: -6, right: -6, background: "red", color: "white", borderRadius: "50%", width: 18, height: 18, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11 }}>{unreadCount}</span>)}
 
             {showInboxList && (
-              <div className="card shadow-sm position-absolute end-0 mt-2" style={{ width: 320, zIndex: 2000 }}>
+              <div className="card shadow-sm position-absolute end-0 mt-2" style={{ width: 360, zIndex: 2000 }}>
                 <div className="card-body p-2">
                   <div className="d-flex justify-content-between align-items-center mb-2">
                     <strong>Inbox</strong>
-                    <button className="btn btn-sm btn-link" onClick={() => { fetchRecentMessages(); }}>Refresh</button>
+                    <div>
+                      <button className="btn btn-sm btn-link" onClick={() => { fetchRecentMessages(); }}>Refresh</button>
+                      <button className="btn btn-sm btn-link" onClick={() => { setShowManageChats((s) => !s); }}>Manage chats</button>
+                    </div>
                   </div>
-                  {recentMessages.length === 0 && <div className="text-center text-muted small">No messages</div>}
-                  {recentMessages.map((m, i) => {
-                    const peer = m.fromUsername === loggedInUsername ? m.toUsername : m.fromUsername;
-                    return (
-                      <div key={`${peer}-${i}`} className="border-bottom py-2" style={{ cursor: "pointer" }} onClick={() => { setShowInboxList(false); openChatWith(peer); }}>
-                        <div className="d-flex justify-content-between">
-                          <div style={{ fontWeight: m.read ? 400 : 700 }}>{peer}</div>
-                          <div style={{ fontSize: 12, opacity: 0.7 }}>{new Date(m.createdAt).toLocaleString()}</div>
-                        </div>
-                        <div style={{ fontSize: 13, color: '#333' }}>{m.text?.slice(0, 80)}</div>
+
+                  {/* Manage chats panel (expanded) */}
+                  {showManageChats ? (
+                    <div>
+                      <div className="text-muted small mb-2">All conversations. You can open or delete any conversation.</div>
+                      <div style={{ maxHeight: 320, overflowY: "auto" }}>
+                        {getUniquePeers().map(({ peer, lastMessage }, idx) => (
+                          <div key={`${peer}-${idx}`} className="d-flex align-items-center justify-content-between py-2 border-bottom">
+                            <div style={{ cursor: "pointer" }} onClick={() => { setShowInboxList(false); openChatWith(peer); }}>
+                              <div style={{ fontWeight: lastMessage && !lastMessage.read ? 700 : 400 }}>{peer} {onlineUsers.includes(peer) && <span style={{ color: '#28a745', marginLeft: 6 }}>●</span>}</div>
+                              <div style={{ fontSize: 12, color: '#666' }}>{String(lastMessage?.text || "").slice(0, 80)}</div>
+                            </div>
+                            <div style={{ display: 'flex', gap: 6 }}>
+                              <button className="btn btn-sm btn-outline-secondary" onClick={() => { openChatWith(peer); setShowInboxList(false); }}>Open</button>
+                              <button className="btn btn-sm btn-outline-danger" onClick={() => deleteConversation(peer)}>Delete</button>
+                            </div>
+                          </div>
+                        ))}
+
+                        {getUniquePeers().length === 0 && <div className="text-center text-muted small">No conversations yet</div>}
                       </div>
-                    );
-                  })}
+
+                      <div className="mt-2 text-end">
+                        <button className="btn btn-sm btn-link" onClick={() => setShowManageChats(false)}>Close</button>
+                      </div>
+                    </div>
+                  ) : (
+                    // Default inbox (compact recent messages)
+                    <div>
+                      {recentMessages.length === 0 && <div className="text-center text-muted small">No messages</div>}
+                      {recentMessages.map((m, i) => {
+                        const peer = m.fromUsername === loggedInUsername ? m.toUsername : m.fromUsername;
+                        return (
+                          <div key={`${peer}-${i}`} className="border-bottom py-2" style={{ cursor: "pointer" }} onClick={() => { setShowInboxList(false); openChatWith(peer); }}>
+                            <div className="d-flex justify-content-between">
+                              <div style={{ fontWeight: m.read ? 400 : 700 }}>{peer}</div>
+                              <div style={{ fontSize: 12, opacity: 0.7 }}>{new Date(m.createdAt).toLocaleString()}</div>
+                            </div>
+                            <div style={{ fontSize: 13, color: '#333' }}>{m.text?.slice(0, 80)}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -503,7 +689,7 @@ export default function Feed({ isProfile = false }) {
                 <div key={c._id} className="border-top pt-2 mb-2">
                   <strong>{c.user.username}:</strong> <span dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(c.text) }} />
                 </div>
-              ))}
+              ))} 
               <AddComment postId={post._id} onAdd={(text) => handleComment(post._id, text)} />
             </div>
           </div>
