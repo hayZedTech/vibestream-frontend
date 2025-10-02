@@ -308,6 +308,12 @@ export default function Feed({ isProfile = false }) {
       return;
     }
 
+    // Prevent sending to self
+    if ((chatTo || "").trim() === (loggedInUsername || "").trim()) {
+      Swal.fire({ icon: "info", title: "Cannot message yourself", text: "Choose another user to chat with.", timer: 1500, showConfirmButton: false });
+      return;
+    }
+
     const text = chatInputRef.current.value.trim();
     const payload = { fromUsername: loggedInUsername, toUsername: chatTo.trim(), text };
 
@@ -339,6 +345,12 @@ export default function Feed({ isProfile = false }) {
   };
 
   const openChatWith = (username) => {
+    if (!username) return;
+    // Prevent opening a chat with self
+    if ((username || "").trim() === (loggedInUsername || "").trim()) {
+      Swal.fire({ icon: "info", title: "Cannot message yourself", timer: 1200, showConfirmButton: false });
+      return;
+    }
     setChatTo(username);
     setChatVisible(true);
     fetchConversation(loggedInUsername, username);
