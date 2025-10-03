@@ -8,7 +8,7 @@ import { io } from "socket.io-client";
 
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:5000";
 // do not auto-connect until we have username
-const socket = io(SOCKET_URL, { autoConnect: false });
+// (moved socket creation into component to avoid multiple connect calls)
 
 export default function Feed({ isProfile = false }) {
   // posts
@@ -20,6 +20,14 @@ export default function Feed({ isProfile = false }) {
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(true);
   const [fetching, setFetching] = useState(false);
+
+  // EDITING state (new)
+  const [editingPostId, setEditingPostId] = useState(null);
+  const [editingText, setEditingText] = useState("");
+  const [editingImage, setEditingImage] = useState(null); // File | null
+  const [editingPreview, setEditingPreview] = useState(null); // preview URL
+  const [editingRemoveImage, setEditingRemoveImage] = useState(false); // whether to remove existing image
+  const [editingLoading, setEditingLoading] = useState(false);
 
   // notifications & chat
   const [notifications, setNotifications] = useState([]);
@@ -48,6 +56,9 @@ export default function Feed({ isProfile = false }) {
   const chatInputRef = useRef(null);
   const chatListRef = useRef(null);
   const quickNameRef = useRef(null);
+
+  // socketRef — single socket instance per mounted component
+  const socketRef = useRef(null);
 
   // ---------------------- message normalization helper ----------------------
   const normalizeMsg = (m) => {
@@ -152,11 +163,25 @@ export default function Feed({ isProfile = false }) {
   useEffect(() => {
     let cancelled = false;
 
+    // create socket instance once (lazy)
+    if (!socketRef.current) {
+      socketRef.current = io(SOCKET_URL, { autoConnect: false });
+    }
+
     (async () => {
       if (loggedInUsername) {
         try {
-          if (!socket.connected) socket.connect();
-          socket.emit("join", loggedInUsername);
+          if (socketRef.current && !socketRef.current.connected) {
+            try { socketRef.current.connect(); } catch (e) { console.warn("socket connect failed:", e); }
+          }
+          if (socketRef.current && socketRef.current.connected) {
+            try { socketRef.current.emit("join", loggedInUsername); } catch (e) { console.warn("socket join error:", e); }
+          } else {
+            // If not connected yet, emit after connect event
+            socketRef.current?.once?.("connect", () => {
+              try { socketRef.current.emit("join", loggedInUsername); } catch (e) { console.warn("socket join once failed:", e); }
+            });
+          }
         } catch (e) { console.warn("socket join error:", e); }
         fetchRecentMessages(loggedInUsername);
         fetchNotifications(loggedInUsername);
@@ -167,8 +192,16 @@ export default function Feed({ isProfile = false }) {
       if (cancelled) return;
       if (user && user.username) {
         try {
-          if (!socket.connected) socket.connect();
-          socket.emit("join", user.username);
+          if (socketRef.current && !socketRef.current.connected) {
+            try { socketRef.current.connect(); } catch (e) { console.warn("socket connect failed after load:", e); }
+          }
+          if (socketRef.current && socketRef.current.connected) {
+            try { socketRef.current.emit("join", user.username); } catch (e) { console.warn("socket join after load error:", e); }
+          } else {
+            socketRef.current?.once?.("connect", () => {
+              try { socketRef.current.emit("join", user.username); } catch (e) { console.warn("socket join once failed after load:", e); }
+            });
+          }
         } catch (e) { console.warn("socket join after load error:", e); }
         fetchRecentMessages(user.username);
         fetchNotifications(user.username);
@@ -176,7 +209,13 @@ export default function Feed({ isProfile = false }) {
       }
     })();
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      // disconnect socket on unmount to free resources
+      try {
+        if (socketRef.current && socketRef.current.connected) socketRef.current.disconnect();
+      } catch (e) { /* ignore */ }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // run once on mount
 
@@ -186,25 +225,36 @@ export default function Feed({ isProfile = false }) {
       return;
     }
 
-    if (!socket.connected) socket.connect();
-    try { socket.emit("join", loggedInUsername); } catch (e) { console.warn("join emit failed", e); }
+    if (!socketRef.current) socketRef.current = io(SOCKET_URL, { autoConnect: false });
+    try {
+      if (!socketRef.current.connected) {
+        try { socketRef.current.connect(); } catch (e) { console.warn("socket connect failed in handler:", e); }
+      }
+    } catch (e) { /* non-fatal */ }
 
-    socket.on("onlineUsers", (list) => setOnlineUsers(Array.isArray(list) ? list : []));
-    socket.on("newPost", (post) => setPosts((prev) => [post, ...prev]));
-    socket.on("newLike", ({ postId, fromUserId }) => {
-      setPosts((prev) => prev.map((p) => (p._id === postId ? { ...p, likes: [...(p.likes || []), fromUserId] } : p)));
-    });
-    socket.on("newComment", ({ postId, text, fromUserId }) => {
+    // ensure join emission with safety
+    try {
+      if (socketRef.current && socketRef.current.connected) {
+        try { socketRef.current.emit("join", loggedInUsername); } catch (e) { console.warn("join emit failed", e); }
+      } else {
+        socketRef.current?.once?.("connect", () => {
+          try { socketRef.current.emit("join", loggedInUsername); } catch (e) { console.warn("join once after connect failed", e); }
+        });
+      }
+    } catch (e) { console.warn("join emit failed", e); }
+
+    const onOnlineUsers = (list) => setOnlineUsers(Array.isArray(list) ? list : []);
+    const onNewPost = (post) => setPosts((prev) => [post, ...prev]);
+    const onNewLike = ({ postId, fromUserId }) => setPosts((prev) => prev.map((p) => (p._id === postId ? { ...p, likes: [...(p.likes || []), fromUserId] } : p)));
+    const onNewComment = ({ postId, text, fromUserId }) => {
       setPosts((prev) => prev.map((p) => p._id === postId ? { ...p, comments: [...(p.comments || []), { text, user: { _id: fromUserId, username: "Someone" } }] } : p));
-    });
-    socket.on("notification", (notif) => {
+    };
+    const onNotification = (notif) => {
       setNotifications((prev) => [notif, ...prev]);
       Swal.fire({ toast: true, position: "top-end", icon: "info", title: `${notif.type} from ${notif.fromUsername || "Someone"}`, showConfirmButton: false, timer: 2500 });
-    });
-
-    socket.on("chatMessage", (rawMsg) => {
+    };
+    const onChatMessage = (rawMsg) => {
       const msg = normalizeMsg(rawMsg);
-
       setRecentMessages((prev) => {
         const arr = Array.isArray(prev) ? [...prev] : [];
         const idx = arr.findIndex((m) => (m._id && msg._id && m._id === msg._id) || (m.createdAt === msg.createdAt && m.fromUsername === msg.fromUsername && m.toUsername === msg.toUsername && m.text === msg.text));
@@ -221,15 +271,27 @@ export default function Feed({ isProfile = false }) {
       } else {
         Swal.fire({ toast: true, position: "top-end", icon: "info", title: `Message from ${msg.fromUsername}: ${String(msg.text).slice(0, 80)}`, showConfirmButton: false, timer: 2500 });
       }
-    });
+    };
+
+    // register listeners safely
+    try {
+      socketRef.current.on("onlineUsers", onOnlineUsers);
+      socketRef.current.on("newPost", onNewPost);
+      socketRef.current.on("newLike", onNewLike);
+      socketRef.current.on("newComment", onNewComment);
+      socketRef.current.on("notification", onNotification);
+      socketRef.current.on("chatMessage", onChatMessage);
+    } catch (e) { console.warn("socket on() registration failed", e); }
 
     return () => {
-      socket.off("onlineUsers");
-      socket.off("newPost");
-      socket.off("newLike");
-      socket.off("newComment");
-      socket.off("notification");
-      socket.off("chatMessage");
+      try {
+        socketRef.current?.off?.("onlineUsers", onOnlineUsers);
+        socketRef.current?.off?.("newPost", onNewPost);
+        socketRef.current?.off?.("newLike", onNewLike);
+        socketRef.current?.off?.("newComment", onNewComment);
+        socketRef.current?.off?.("notification", onNotification);
+        socketRef.current?.off?.("chatMessage", onChatMessage);
+      } catch (e) { /* ignore */ }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loggedInUsername, chatTo]);
@@ -283,7 +345,7 @@ export default function Feed({ isProfile = false }) {
       setPosts((prev) => [res.data, ...prev]);
       setNewPostText(""); setNewPostImage(null); setPreviewImage(null);
       Swal.fire({ icon: "success", title: "Posted 🎉", timer: 1500, showConfirmButton: false });
-      socket.emit("newPost", res.data);
+      try { if (socketRef.current?.connected) socketRef.current.emit("newPost", res.data); } catch (e) { /* non-fatal */ }
     } catch (err) {
       console.error("create post error", err);
       Swal.fire("Error", "Failed to create post", "error");
@@ -293,9 +355,10 @@ export default function Feed({ isProfile = false }) {
   // ---------------------- like / comment / delete ----------------------
   const handleLike = async (postId) => {
     try {
+      // optimistic UI could be added here, but keep existing behavior with server response
       const res = await API.put(`/posts/${postId}/like`);
-      setPosts((prev) => prev.map((p) => (p._1d === postId ? res.data : p)));
-      socket.emit("newLike", { postId, fromUserId: loggedInUsername, postOwnerId: res.data.user.username });
+      setPosts((prev) => prev.map((p) => (p._id === postId ? res.data : p)));
+      try { if (socketRef.current?.connected) socketRef.current.emit("newLike", { postId, fromUserId: loggedInUsername, postOwnerId: res.data.user.username }); } catch (e) { /* non-fatal */ }
     } catch (err) {
       console.warn("like error", err);
       Swal.fire("Error", "Failed to update like", "error");
@@ -308,7 +371,7 @@ export default function Feed({ isProfile = false }) {
       const sanitized = DOMPurify.sanitize(text);
       const res = await API.post(`/posts/${postId}/comment`, { text: sanitized });
       setPosts((prev) => prev.map((p) => (p._id === postId ? res.data : p)));
-      socket.emit("newComment", { postId, text: sanitized, fromUserId: loggedInUsername, postOwnerId: res.data.user.username });
+      try { if (socketRef.current?.connected) socketRef.current.emit("newComment", { postId, text: sanitized, fromUserId: loggedInUsername, postOwnerId: res.data.user.username }); } catch (e) { /* non-fatal */ }
     } catch (err) {
       console.warn("comment error", err);
       Swal.fire("Error", "Failed to add comment", "error");
@@ -320,6 +383,116 @@ export default function Feed({ isProfile = false }) {
     if (!confirm.isConfirmed) return;
     try { await API.delete(`/posts/${postId}`); setPosts((prev) => prev.filter((p) => p._id !== postId)); Swal.fire("Deleted!", "Your post has been deleted", "success"); }
     catch (err) { console.warn("delete error", err); Swal.fire("Error", "Failed to delete post", "error"); }
+  };
+
+  // ---------------------- EDIT handlers (new) ----------------------
+  const startEdit = (post) => {
+    setEditingPostId(post._id);
+    setEditingText(post.text || "");
+    setEditingImage(null);
+    setEditingPreview(post.image || null);
+    setEditingRemoveImage(false);
+  };
+
+  const cancelEdit = () => {
+    setEditingPostId(null);
+    setEditingText("");
+    setEditingImage(null);
+    setEditingPreview(null);
+    setEditingRemoveImage(false);
+    setEditingLoading(false);
+  };
+
+  const handleEditImageChange = (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    if (!validateImage(f)) return;
+    setEditingImage(f);
+    try { setEditingPreview(URL.createObjectURL(f)); } catch (e) { setEditingPreview(null); }
+    setEditingRemoveImage(false);
+  };
+
+  const toggleRemoveImage = () => {
+    // if currently removing, undo and restore preview from post if any
+    if (editingRemoveImage) {
+      setEditingRemoveImage(false);
+      // try to find current post image
+      const p = posts.find((x) => x._id === editingPostId);
+      setEditingPreview(p?.image || null);
+      setEditingImage(null);
+    } else {
+      setEditingRemoveImage(true);
+      setEditingImage(null);
+      setEditingPreview(null);
+    }
+  };
+
+  const saveEdit = async (postId) => {
+    // Optimistic update:
+    const prevPosts = posts.map((p) => ({ ...p })); // shallow copy to allow revert
+    const prevPost = prevPosts.find(p => p._id === postId);
+
+    // prepare optimistic post object
+    const optimisticText = DOMPurify.sanitize(editingText || "");
+    const optimisticImage = editingImage ? (editingPreview || null) : (editingRemoveImage ? null : (prevPost?.image || null));
+
+    setEditingLoading(true);
+    // apply optimistic UI change immediately
+    setPosts((prev) => prev.map((p) => (p._id === postId ? { ...p, text: optimisticText, image: optimisticImage } : p)));
+
+    try {
+      const form = new FormData();
+      form.append("text", optimisticText);
+      // If user provided a new image file, append it
+      if (editingImage instanceof File) {
+        form.append("image", editingImage);
+      }
+      // If user wants to remove the existing image, include flag
+      if (editingRemoveImage) {
+        form.append("removeImage", "1");
+      }
+
+      // Try multiple update endpoints to be resilient against differing backend routes
+      const attempts = [
+        async () => API.put(`/posts/${postId}`, form, { headers: { "Content-Type": "multipart/form-data" } }),
+        async () => API.post(`/posts/${postId}`, form, { headers: { "Content-Type": "multipart/form-data" } }),
+        async () => API.post(`/posts/${postId}/edit`, form, { headers: { "Content-Type": "multipart/form-data" } }),
+        async () => API.put(`/posts/${postId}/edit`, form, { headers: { "Content-Type": "multipart/form-data" } }),
+        async () => API.post(`/posts/edit/${postId}`, form, { headers: { "Content-Type": "multipart/form-data" } }),
+      ];
+
+      let res = null;
+      let lastErr = null;
+      for (const attempt of attempts) {
+        try {
+          res = await attempt();
+          if (res && res.data) break;
+        } catch (e) {
+          lastErr = e;
+          // continue to next attempt
+        }
+      }
+
+      if (!res || !res.data) {
+        // no attempt succeeded
+        throw lastErr || new Error("No update endpoint succeeded");
+      }
+
+      // server returned canonical post object — update UI with it (may include edited:true)
+      setPosts((prev) => prev.map((p) => (p._id === postId ? res.data : p)));
+
+      Swal.fire({ icon: "success", title: "Post updated", timer: 1400, showConfirmButton: false });
+      // clear edit UI
+      cancelEdit();
+      // inform others (non-fatal) — guard emit
+      try { if (socketRef.current?.connected) socketRef.current.emit("updatePost", res.data); } catch (e) { /* non-fatal */ }
+    } catch (err) {
+      console.error("edit save error", err);
+      // revert optimistic changes
+      if (prevPosts) setPosts(prevPosts);
+      Swal.fire("Error", "Failed to update post", "error");
+      setEditingLoading(false);
+    }
   };
 
   // ---------------------- conversation fetch ----------------------
@@ -376,7 +549,7 @@ export default function Feed({ isProfile = false }) {
       const serverMsg = err?.response?.data?.msg || err?.response?.data || err.message || String(err);
       Swal.fire("Send failed", String(serverMsg), "error");
       try {
-        socket.emit("chatMessage", payload);
+        if (socketRef.current?.connected) socketRef.current.emit("chatMessage", payload);
       } catch (emitErr) {
         console.warn("socket emit fallback failed", emitErr);
       }
@@ -489,8 +662,13 @@ export default function Feed({ isProfile = false }) {
     setLoggedInUsername(v);
     localStorage.setItem("username", v);
     try {
-      if (!socket.connected) socket.connect();
-      socket.emit("join", v);
+      if (socketRef.current && !socketRef.current.connected) socketRef.current.connect();
+      if (socketRef.current?.connected) socketRef.current.emit("join", v);
+      else {
+        socketRef.current?.once?.("connect", () => {
+          try { socketRef.current.emit("join", v); } catch (e) { console.warn("join once failed after setQuickName:", e); }
+        });
+      }
     } catch (e) { console.warn("socket join after set name failed", e); }
     fetchRecentMessages(v);
     fetchNotifications(v);
@@ -666,17 +844,44 @@ export default function Feed({ isProfile = false }) {
                 <span style={{ position: 'absolute', right: -2, bottom: -2 }}><OnlineDot username={post.user.username} /></span>
               </div>
               <strong style={{ cursor: "pointer" }} onClick={() => openChatWith(post.user.username)}>{post.user.username}</strong>
+              {post.edited && <span className="badge bg-secondary ms-2" style={{ fontSize: 11 }}>edited</span>}
 
               {post.user.username !== loggedInUsername && (
                 <button className="btn btn-sm btn-outline-primary ms-auto" title="Message" onClick={() => openChatWith(post.user.username)}>💬</button>
               )}
             </div>
 
-            {post.text && <p className="mb-2">{post.text}</p>}
-            {post.image && <div className="mb-3 text-center"><img src={post.image} alt="post" className="img-fluid rounded" style={{ maxHeight: 220, objectFit: "cover" }} /></div>}
+            {/* Editable area */}
+            {editingPostId === post._id ? (
+              <>
+                <textarea className="form-control mb-2" value={editingText} onChange={(e) => setEditingText(e.target.value)} rows={3} />
+                {editingPreview && <div className="mb-2 text-center"><img src={editingPreview} alt="edit-preview" className="img-fluid rounded" style={{ maxHeight: 220 }} /></div>}
+                <div className="mb-2 d-flex gap-2 align-items-center">
+                  <input type="file" accept="image/*" onChange={handleEditImageChange} />
+                  <button className={`btn btn-sm ${editingRemoveImage ? "btn-warning" : "btn-outline-warning"}`} onClick={toggleRemoveImage}>{editingRemoveImage ? "Undo remove image" : "Remove existing image"}</button>
+                </div>
+              </>
+            ) : (
+              <>
+                {post.text && <p className="mb-2">{post.text}</p>}
+                {post.image && <div className="mb-3 text-center"><img src={post.image} alt="post" className="img-fluid rounded" style={{ maxHeight: 220, objectFit: "cover" }} /></div>}
+              </>
+            )}
 
             <div className="d-flex mb-2">
               <button className={`btn btn-sm me-2 ${((post.likes || []).includes(loggedInUsername) || (post.likes || []).includes(loggedInUserId)) ? "btn-success" : "btn-outline-success"}`} onClick={() => handleLike(post._id)}>👍 Like ({post.likes?.length || 0})</button>
+
+              {/* Edit button restricted to post owners only */}
+              {(post.user?.username === loggedInUsername || post.user?._id === loggedInUserId) ? (
+                editingPostId === post._id ? (
+                  <>
+                    <button className="btn btn-sm btn-primary me-2" onClick={() => saveEdit(post._id)} disabled={editingLoading}>{editingLoading ? <span className="spinner-border spinner-border-sm me-2" role="status" /> : "Save"}</button>
+                    <button className="btn btn-sm btn-outline-secondary me-2" onClick={cancelEdit} disabled={editingLoading}>Cancel</button>
+                  </>
+                ) : (
+                  <button className="btn btn-sm btn-outline-secondary me-2" onClick={() => startEdit(post)}>✏️ Edit</button>
+                )
+              ) : null}
 
               {(post.user?.username === loggedInUsername || post.user?._id === loggedInUserId) && (
                 <button className="btn btn-sm btn-outline-danger" onClick={() => handleDelete(post._id)}>🗑 Delete</button>
