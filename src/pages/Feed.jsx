@@ -29,6 +29,12 @@ export default function Feed({ isProfile = false }) {
   const [editingRemoveImage, setEditingRemoveImage] = useState(false); // whether to remove existing image
   const [editingLoading, setEditingLoading] = useState(false);
 
+  // NEW: comment editing state
+  const [editingCommentId, setEditingCommentId] = useState(null); // comment _id being edited
+  const [editingCommentText, setEditingCommentText] = useState("");
+  const [editingCommentPostId, setEditingCommentPostId] = useState(null); // post id that comment belongs to
+  const [editingCommentLoading, setEditingCommentLoading] = useState(false);
+
   // notifications & chat
   const [notifications, setNotifications] = useState([]);
   const [chatMessages, setChatMessages] = useState([]);
@@ -495,6 +501,128 @@ export default function Feed({ isProfile = false }) {
     }
   };
 
+  // ---------------------- COMMENT edit & delete handlers (added) ----------------------
+
+  const startEditComment = (postId, comment) => {
+    setEditingCommentId(comment._id);
+    setEditingCommentText(comment.text || "");
+    setEditingCommentPostId(postId);
+  };
+
+  const cancelEditComment = () => {
+    setEditingCommentId(null);
+    setEditingCommentText("");
+    setEditingCommentPostId(null);
+    setEditingCommentLoading(false);
+  };
+
+  const saveEditComment = async (postId, commentId) => {
+  if (!commentId || !postId) return;
+  const trimmed = (editingCommentText || "").trim();
+  if (!trimmed) {
+    Swal.fire("Empty comment", "Please enter some text or cancel.", "warning");
+    return;
+  }
+
+  const prevPosts = posts.map(p => ({ 
+    ...p, 
+    comments: Array.isArray(p.comments) ? [...p.comments] : [] 
+  }));
+  setEditingCommentLoading(true);
+
+  // Optimistic update
+  setPosts(prev => prev.map(p => {
+    if (p._id !== postId) return p;
+    return {
+      ...p,
+      comments: (p.comments || []).map(c => 
+        c._id === commentId ? { ...c, text: trimmed, edited: true } : c
+      )
+    };
+  }));
+
+  try {
+    const sanitized = DOMPurify.sanitize(trimmed);
+
+    // ✅ Single correct endpoint
+    const res = await API.put(`/posts/${postId}/comments/${commentId}`, { text: sanitized });
+
+    if (res && res.data) {
+      if (res.data._id) {
+        // If backend returns updated post
+        setPosts(prev => prev.map(p => (p._id === res.data._id ? res.data : p)));
+      } else if (res.data.comment) {
+        // If backend only returns updated comment
+        const updatedComment = res.data.comment;
+        setPosts(prev => prev.map(p => {
+          if (p._id !== postId) return p;
+          return {
+            ...p,
+            comments: (p.comments || []).map(c => 
+              c._id === commentId ? updatedComment : c
+            )
+          };
+        }));
+      }
+      Swal.fire({ 
+        icon: "success", 
+        title: "Comment updated", 
+        timer: 1200, 
+        showConfirmButton: false 
+      });
+    }
+
+    cancelEditComment();
+  } catch (err) {
+    console.error("saveEditComment error", err);
+    // rollback
+    setPosts(prevPosts);
+    Swal.fire("Error", "Failed to update comment", "error");
+  } finally {
+    setEditingCommentLoading(false);
+  }
+};
+
+
+  const handleDeleteComment = async (postId, commentId) => {
+  if (!postId || !commentId) return;
+
+  const ok = await Swal.fire({
+    title: "Delete comment?",
+    text: "This cannot be undone.",
+    icon: "warning",
+    showCancelButton: true,
+    confirmButtonText: "Delete",
+    cancelButtonText: "Cancel"
+  });
+  if (!ok.isConfirmed) return;
+
+  const prevPosts = [...posts];
+
+  // optimistic update
+  setPosts(prev =>
+    prev.map(p =>
+      p._id === postId
+        ? { ...p, comments: p.comments.filter(c => c._id !== commentId) }
+        : p
+    )
+  );
+
+  try {
+    const res = await API.delete(`/posts/${postId}/comments/${commentId}`);
+    if (res.data && res.data._id) {
+      setPosts(prev => prev.map(p => (p._id === res.data._id ? res.data : p)));
+    }
+
+    Swal.fire({ icon: "success", title: "Deleted", timer: 1200, showConfirmButton: false });
+  } catch (err) {
+    console.warn("delete comment error", err);
+    setPosts(prevPosts); // revert
+    Swal.fire("Error", "Failed to delete comment", "error");
+  }
+};
+
+
   // ---------------------- conversation fetch ----------------------
   const fetchConversation = async (userA, userB) => {
     if (!userA || !userB) return;
@@ -892,11 +1020,46 @@ export default function Feed({ isProfile = false }) {
               <h6 className="fw-bold">💬 Comments</h6>
               {(post.comments || []).map((c) => (
                 <div key={c._id} className="border-top pt-2 mb-2">
-                  <strong>{c.user.username}:</strong> <span dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(c.text) }} />
+                  {/* If this comment is in edit mode, show input */}
+                  {editingCommentId === c._id ? (
+                    <div className="d-flex align-items-start gap-2">
+                      <div style={{ flex: 1 }}>
+                        <input
+                          className="form-control form-control-sm mb-1"
+                          value={editingCommentText}
+                          onChange={(e) => setEditingCommentText(e.target.value)}
+                          placeholder="Edit comment..."
+                        />
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button className="btn btn-sm btn-primary" onClick={() => saveEditComment(editingCommentPostId, editingCommentId)} disabled={editingCommentLoading}>
+                            {editingCommentLoading ? <span className="spinner-border spinner-border-sm me-2" role="status" /> : "Save"}
+                          </button>
+                          <button className="btn btn-sm btn-outline-secondary" onClick={cancelEditComment} disabled={editingCommentLoading}>Cancel</button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                      <div style={{ flex: 1 }}>
+                        <strong>{c.user?.username || "Unknown"}:</strong> <span dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(c.text) }} />
+                        {c.edited && <span className="badge bg-secondary ms-2" style={{ fontSize: 10 }}>edited</span>}
+                      </div>
+
+                      {/* show edit/delete only for comment owner */}
+                      {(c.user?.username === loggedInUsername || c.user?._id === loggedInUserId) && (
+                        <div style={{ display: "flex", gap: 6, marginLeft: 12 }}>
+                          <button className="btn btn-sm btn-outline-secondary" onClick={() => startEditComment(post._id, c)}>✏️</button>
+                          <button className="btn btn-sm btn-outline-danger" onClick={() => handleDeleteComment(post._id, c._id)}>🗑</button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               ))} 
               <AddComment postId={post._id} onAdd={(text) => handleComment(post._id, text)} />
             </div>
+
+            
           </div>
         </div>
       ))}
@@ -987,16 +1150,24 @@ function AddComment({ postId, onAdd }) {
   const [text, setText] = useState("");
   const handleSubmit = () => {
     if (!text.trim()) return;
-    onAdd(postId, text);
+    // Pass only the comment text — parent already knows postId via closure
+    onAdd(text);
     setText("");
   };
   return (
     <div className="d-flex mt-2">
-      <input type="text" className="form-control me-2" placeholder="Write a comment..." value={text} onChange={(e) => setText(e.target.value)} />
+      <input
+        type="text"
+        className="form-control me-2"
+        placeholder="Write a comment..."
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+      />
       <button className="btn btn-sm btn-primary" onClick={handleSubmit}>Send</button>
     </div>
   );
 }
+
 
 // NotificationsDropdown helper (open controlled by parent)
 function NotificationsDropdown({ notifications, onClickNotif, open, setOpen }) {
